@@ -1,23 +1,3 @@
-/*
- * Cotton fiber radius/width measurement from a longitudinal microscopic BMP.
- *
- * Workflow from the PPT and Xu et al. (Textile Research Journal, 2009):
- * grayscale -> binary -> denoise -> fill voids -> thinning -> pruning ->
- * distance transform -> radius/width statistics.
- *
- * This final version improves void filling in two ways:
- *   1. Fills closed background components only when their size and span match
- *      fiber internal voids.
- *   2. Fills larger slit-like bright voids that are not perfectly closed by
- *      detecting local foreground on opposite sides of the bright slit.
- *
- * Build:
- *   gcc cotton_fiber_radius_final.c -O2 -std=c99 -lm -o cotton_fiber_radius_final
- *
- * Run:
- *   cotton_fiber_radius_final "妫夎姳绾ょ淮鏄惧井鍥惧儚.bmp" final_radius 0.85
- */
-
 #include <errno.h>
 #include <float.h>
 #include <math.h>
@@ -223,6 +203,30 @@ static int write_bmp_gray(const char *path, const unsigned char *gray, int w, in
     return ok;
 }
 
+static void write_dtm_bmp(const char *path, const int *dist, int w, int h) {
+    unsigned char *gray = (unsigned char *)malloc((size_t)w * h);
+    int max_d = 0;
+    if (!gray) return;
+    
+    for (int i = 0; i < w * h; ++i) {
+        if (dist[i] < INF_DIST && dist[i] > max_d) {
+            max_d = dist[i];
+        }
+    }
+    if (max_d == 0) max_d = 1; 
+    
+    for (int i = 0; i < w * h; ++i) {
+        if (dist[i] >= INF_DIST || dist[i] == 0) {
+            gray[i] = 0; 
+        } else {
+            int val = (dist[i] * 255) / max_d;
+            gray[i] = (unsigned char)(val > 255 ? 255 : val);
+        }
+    }
+    write_bmp_gray(path, gray, w, h);
+    free(gray);
+}
+
 static int otsu_threshold(const unsigned char *gray, int n) {
     long hist[256] = {0};
     double total = 0.0, sum0 = 0.0, best = -1.0;
@@ -316,20 +320,66 @@ static long denoise_components(unsigned char *bin, int w, int h, int min_area, i
     return removed;
 }
 
-static double background_mean(const unsigned char *gray, const unsigned char *bin, int n) {
-    double s = 0.0;
-    long c = 0;
-    for (int i = 0; i < n; ++i) {
-        if (!bin[i] && gray[i] > 180) {
-            s += gray[i];
-            c++;
+// ==========================================
+// 边缘修复组件：加强版膨胀与腐蚀 (支持边界保护)
+// ==========================================
+static void morph_dilate(const unsigned char *src, unsigned char *dst, int w, int h, int r) {
+    int n = w * h;
+    memcpy(dst, src, n);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (src[y * w + x]) continue; 
+            int fill = 0;
+            for (int dy = -r; dy <= r && !fill; ++dy) {
+                for (int dx = -r; dx <= r && !fill; ++dx) {
+                    if (dx * dx + dy * dy <= r * r) {
+                        int nx = x + dx, ny = y + dy;
+                        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                            if (src[ny * w + nx]) fill = 1;
+                        }
+                    }
+                }
+            }
+            dst[y * w + x] = fill;
         }
     }
-    return c ? s / c : 255.0;
 }
 
-static long fill_closed_voids(unsigned char *bin, const unsigned char *gray, int w, int h,
-                              int max_area, int max_span, double bg_mean) {
+static void morph_erode(const unsigned char *src, unsigned char *dst, int w, int h, int r) {
+    int n = w * h;
+    memcpy(dst, src, n);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (!src[y * w + x]) continue; 
+            int keep = 1;
+            for (int dy = -r; dy <= r && keep; ++dy) {
+                for (int dx = -r; dx <= r && keep; ++dx) {
+                    if (dx * dx + dy * dy <= r * r) {
+                        int nx = x + dx, ny = y + dy;
+                        // 边界保护：越界视作前景，避免边缘纤维被腐蚀变细
+                        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                            if (!src[ny * w + nx]) keep = 0;
+                        }
+                    }
+                }
+            }
+            dst[y * w + x] = keep;
+        }
+    }
+}
+
+static void morph_close(unsigned char *bin, int w, int h, int r) {
+    unsigned char *tmp = (unsigned char *)malloc((size_t)w * h);
+    if (!tmp) return;
+    morph_dilate(bin, tmp, w, h, r);
+    morph_erode(tmp, bin, w, h, r);
+    free(tmp);
+}
+
+// ==========================================
+// 深度内部孔洞填充 (不考虑亮度，只看形状)
+// ==========================================
+static long fill_closed_voids(unsigned char *bin, int w, int h, int max_area, int max_span) {
     int n = w * h;
     unsigned char *seen = (unsigned char *)calloc((size_t)n, 1);
     Point *q = (Point *)malloc((size_t)n * sizeof(Point));
@@ -345,19 +395,21 @@ static long fill_closed_voids(unsigned char *bin, const unsigned char *gray, int
         for (int x = 0; x < w; ++x) {
             int idx = y * w + x;
             int head = 0, tail = 0, minx = x, maxx = x, miny = y, maxy = y, border = 0;
-            double gsum = 0.0;
             int area, span, fill = 0;
+            
             if (bin[idx] || seen[idx]) continue;
 
             push_if(seen, q, &tail, w, h, x, y, 0, bin);
             while (head < tail) {
                 Point p = q[head++];
+                // 触碰到图像边缘说明是外部空间
                 if (p.x == 0 || p.y == 0 || p.x == w - 1 || p.y == h - 1) border = 1;
+                
                 if (p.x < minx) minx = p.x;
                 if (p.x > maxx) maxx = p.x;
                 if (p.y < miny) miny = p.y;
                 if (p.y > maxy) maxy = p.y;
-                gsum += gray[p.y * w + p.x];
+                
                 push_if(seen, q, &tail, w, h, p.x + 1, p.y, 0, bin);
                 push_if(seen, q, &tail, w, h, p.x - 1, p.y, 0, bin);
                 push_if(seen, q, &tail, w, h, p.x, p.y + 1, 0, bin);
@@ -365,10 +417,12 @@ static long fill_closed_voids(unsigned char *bin, const unsigned char *gray, int
             }
             area = tail;
             span = (maxx - minx + 1 > maxy - miny + 1) ? maxx - minx + 1 : maxy - miny + 1;
+            
+            // 只要被包围的洞口尺寸在合理范围内，强行填充
             if (!border && area <= max_area && span <= max_span) {
-                double m = gsum / area;
-                if (area <= 700 || m < bg_mean - 2.0) fill = 1;
+                fill = 1;
             }
+            
             if (fill) {
                 for (int i = 0; i < tail; ++i) bin[q[i].y * w + q[i].x] = 1;
                 filled += tail;
@@ -376,125 +430,6 @@ static long fill_closed_voids(unsigned char *bin, const unsigned char *gray, int
         }
     }
 
-    free(seen);
-    free(q);
-    return filled;
-}
-
-static int has_foreground_ray(const unsigned char *bin, int w, int h, int x, int y, int dx, int dy, int max_d) {
-    for (int d = 1; d <= max_d; ++d) {
-        int nx = x + dx * d;
-        int ny = y + dy * d;
-        if (nx < 0 || nx >= w || ny < 0 || ny >= h) return 0;
-        if (bin[ny * w + nx]) return d;
-    }
-    return 0;
-}
-
-static int local_foreground_count(const unsigned char *bin, int w, int h, int x, int y, int r) {
-    int c = 0;
-    for (int yy = y - r; yy <= y + r; ++yy) {
-        if (yy < 0 || yy >= h) continue;
-        for (int xx = x - r; xx <= x + r; ++xx) {
-            if (xx < 0 || xx >= w) continue;
-            c += bin[yy * w + xx] ? 1 : 0;
-        }
-    }
-    return c;
-}
-
-static long fill_slit_voids(unsigned char *bin, const unsigned char *gray, int w, int h, int threshold) {
-    int n = w * h;
-    unsigned char *mark = (unsigned char *)calloc((size_t)n, 1);
-    unsigned char *seen = (unsigned char *)calloc((size_t)n, 1);
-    Point *q = (Point *)malloc((size_t)n * sizeof(Point));
-    long filled = 0;
-    int probe = 22;
-    int local_r = 18;
-    int local_min = 230;
-
-    if (!mark || !seen || !q) {
-        free(mark);
-        free(seen);
-        free(q);
-        return 0;
-    }
-    for (int y = local_r; y < h - local_r; ++y) {
-        for (int x = local_r; x < w - local_r; ++x) {
-            int idx = y * w + x;
-            int pairs = 0, close_pair = 0;
-            int d1, d2;
-            if (bin[idx]) continue;
-            if (gray[idx] < threshold - 8) continue;
-
-            d1 = has_foreground_ray(bin, w, h, x, y, 1, 0, probe);
-            d2 = has_foreground_ray(bin, w, h, x, y, -1, 0, probe);
-            if (d1 && d2) { pairs++; if (d1 + d2 <= 34) close_pair = 1; }
-            d1 = has_foreground_ray(bin, w, h, x, y, 0, 1, probe);
-            d2 = has_foreground_ray(bin, w, h, x, y, 0, -1, probe);
-            if (d1 && d2) { pairs++; if (d1 + d2 <= 34) close_pair = 1; }
-            d1 = has_foreground_ray(bin, w, h, x, y, 1, 1, probe);
-            d2 = has_foreground_ray(bin, w, h, x, y, -1, -1, probe);
-            if (d1 && d2) { pairs++; if (d1 + d2 <= 34) close_pair = 1; }
-            d1 = has_foreground_ray(bin, w, h, x, y, 1, -1, probe);
-            d2 = has_foreground_ray(bin, w, h, x, y, -1, 1, probe);
-            if (d1 && d2) { pairs++; if (d1 + d2 <= 34) close_pair = 1; }
-
-            (void)close_pair;
-            if (pairs >= 2 &&
-                local_foreground_count(bin, w, h, x, y, local_r) >= local_min) {
-                mark[idx] = 1;
-            }
-        }
-    }
-
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            int idx = y * w + x;
-            int head = 0, tail = 0, minx = x, maxx = x, miny = y, maxy = y;
-            int area, span, bw, bh, accept;
-            if (!mark[idx] || seen[idx]) continue;
-
-            seen[idx] = 1;
-            q[tail++] = (Point){x, y};
-            while (head < tail) {
-                Point p = q[head++];
-                if (p.x < minx) minx = p.x;
-                if (p.x > maxx) maxx = p.x;
-                if (p.y < miny) miny = p.y;
-                if (p.y > maxy) maxy = p.y;
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        int nx = p.x + dx, ny = p.y + dy, ni;
-                        if (!dx && !dy) continue;
-                        if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
-                        ni = ny * w + nx;
-                        if (mark[ni] && !seen[ni]) {
-                            seen[ni] = 1;
-                            q[tail++] = (Point){nx, ny};
-                        }
-                    }
-                }
-            }
-
-            area = tail;
-            bw = maxx - minx + 1;
-            bh = maxy - miny + 1;
-            span = bw > bh ? bw : bh;
-            accept = (area <= 4200 && span <= 260);
-            if (accept && area > 1300) {
-                double density = (double)area / (double)(bw * bh);
-                accept = density < 0.55;
-            }
-            if (accept) {
-                for (int i = 0; i < tail; ++i) {
-                    bin[q[i].y * w + q[i].x] = 1;
-                }
-                filled += tail;
-            }
-        }
-    }
-    free(mark);
     free(seen);
     free(q);
     return filled;
@@ -766,17 +701,17 @@ static void text_rot90(unsigned char *rgb, int w, int h, int x, int y, const cha
     }
 }
 
-static void overlay(const char *path, const unsigned char *gray, const unsigned char *skel, int w, int h) {
+static void overlay(const char *path, const unsigned char *bg_gray, const unsigned char *skel, int w, int h) {
     unsigned char *rgb = (unsigned char *)malloc((size_t)w * h * 3);
     if (!rgb) return;
     for (int i = 0; i < w * h; ++i) {
-        rgb[i * 3 + 0] = gray[i];
-        rgb[i * 3 + 1] = gray[i];
-        rgb[i * 3 + 2] = gray[i];
+        rgb[i * 3 + 0] = bg_gray[i];
+        rgb[i * 3 + 1] = bg_gray[i];
+        rgb[i * 3 + 2] = bg_gray[i];
         if (skel[i]) {
-            rgb[i * 3 + 0] = 220;
-            rgb[i * 3 + 1] = 0;
-            rgb[i * 3 + 2] = 0;
+            rgb[i * 3 + 0] = 255; 
+            rgb[i * 3 + 1] = 0;   
+            rgb[i * 3 + 2] = 0;   
         }
     }
     write_bmp_rgb(path, rgb, w, h);
@@ -864,8 +799,7 @@ static int analyze(const char *input, const char *prefix, double um_per_px) {
     int prune_iter = 8, margin = 6;
     unsigned char *binary = NULL, *denoised = NULL, *filled = NULL, *skel_raw = NULL, *skel = NULL, *tmp = NULL;
     int *dist = NULL;
-    long removed_noise, closed_fill, slit_fill;
-    double bgm;
+    long removed_noise, closed_fill;
     Stats rpx, rum, wpx, wum;
     int nbins = 45;
     double binw = 1.0;
@@ -894,14 +828,25 @@ static int analyze(const char *input, const char *prefix, double um_per_px) {
     memcpy(denoised, binary, (size_t)n);
     removed_noise = denoise_components(denoised, img.w, img.h, min_area, min_span);
 
-    bgm = background_mean(img.gray, denoised, n);
-    max_hole_area = n / 160;
-    if (max_hole_area > 8200) max_hole_area = 8200;
-    max_hole_span = 240;
     memcpy(filled, denoised, (size_t)n);
-    closed_fill = fill_closed_voids(filled, img.gray, img.w, img.h, max_hole_area, max_hole_span, bgm);
-    slit_fill = fill_slit_voids(filled, img.gray, img.w, img.h, th);
-    closed_fill += fill_closed_voids(filled, img.gray, img.w, img.h, max_hole_area, max_hole_span, bgm);
+    
+    // =======================================================
+    // 缝合与补洞算法终极进化
+    // =======================================================
+    
+    // 1. 估算缺口大小进行形态学闭运算 (抹灰缝合)
+    // 根据您的反馈，交叉点的 Gap 很大(>20px)，而纤维内部边缘缺口较窄(<16px)。
+    // 这里采用半径 r=8 的结构元素：它能完美跨过最多 16 像素的缺口(将其封闭)，
+    // 而绝不会把宽度远超 20 像素的交叉 Gap 封死。
+    int morph_radius = 8;
+    morph_close(filled, img.w, img.h, morph_radius);
+    
+    // 2. 深度闭孔填充 (无脑填坑)
+    // 经过上一步，那些缺口已经被“桥接”变成了独立的内部洞。
+    // 我们将允许填洞的最大面积放宽到 5000 像素。只要不是巨大的外部空间，一律填满。
+    max_hole_area = 5000; 
+    max_hole_span = 120;   
+    closed_fill = fill_closed_voids(filled, img.w, img.h, max_hole_area, max_hole_span);
 
     for (int i = 0; i < n; ++i) {
         if (denoised[i]) area_before++;
@@ -946,28 +891,41 @@ static int analyze(const char *input, const char *prefix, double um_per_px) {
     for (int i = 0; i < nbins; ++i) fprintf(hcsv, "%.3f,%.3f,%ld\n", i * binw, (i + 1) * binw, hist[i]);
     fclose(hcsv); hcsv = NULL;
 
+    // 输出图像
     snprintf(path, sizeof(path), "%s_01_grayscale.bmp", prefix);
     write_bmp_gray(path, img.gray, img.w, img.h);
+    
     bin_to_gray(binary, tmp, n);
     snprintf(path, sizeof(path), "%s_02_binary.bmp", prefix);
     write_bmp_gray(path, tmp, img.w, img.h);
+    
     bin_to_gray(denoised, tmp, n);
     snprintf(path, sizeof(path), "%s_03_denoised.bmp", prefix);
     write_bmp_gray(path, tmp, img.w, img.h);
+    
     bin_to_gray(filled, tmp, n);
     snprintf(path, sizeof(path), "%s_04_filled_voids.bmp", prefix);
     write_bmp_gray(path, tmp, img.w, img.h);
+    
     bin_to_gray(skel_raw, tmp, n);
     snprintf(path, sizeof(path), "%s_05_skeleton_raw_no_pruning.bmp", prefix);
     write_bmp_gray(path, tmp, img.w, img.h);
+    
     bin_to_gray(skel, tmp, n);
     snprintf(path, sizeof(path), "%s_06_skeleton_pruned.bmp", prefix);
     write_bmp_gray(path, tmp, img.w, img.h);
-    snprintf(path, sizeof(path), "%s_07_skeleton_overlay.bmp", prefix);
-    overlay(path, img.gray, skel, img.w, img.h);
-    snprintf(path, sizeof(path), "%s_08_width_frequency_histogram.bmp", prefix);
+    
+    snprintf(path, sizeof(path), "%s_07_distance_transform.bmp", prefix);
+    write_dtm_bmp(path, dist, img.w, img.h);
+    
+    bin_to_gray(filled, tmp, n);
+    snprintf(path, sizeof(path), "%s_08_skeleton_overlay.bmp", prefix);
+    overlay(path, tmp, skel, img.w, img.h);
+    
+    snprintf(path, sizeof(path), "%s_09_width_frequency_histogram.bmp", prefix);
     write_histogram_bmp(path, hist, nbins, binw, &wpx);
 
+    // 统计数据
     snprintf(path, sizeof(path), "%s_summary.txt", prefix);
     sum = fopen(path, "w");
     if (!sum) goto fail;
@@ -976,9 +934,7 @@ static int analyze(const char *input, const char *prefix, double um_per_px) {
     fprintf(sum, "Scale: %.6f um/pixel\n", um_per_px);
     fprintf(sum, "Otsu threshold: %d\n", th);
     fprintf(sum, "Denoise: min_area=%d, min_span=%d, removed_noise_pixels=%ld\n", min_area, min_span, removed_noise);
-    fprintf(sum, "Closed void filling: max_area=%d, max_span=%d, background_mean=%.3f, filled_pixels=%ld\n",
-            max_hole_area, max_hole_span, bgm, closed_fill);
-    fprintf(sum, "Slit-like void filling: filled_pixels=%ld\n", slit_fill);
+    fprintf(sum, "Morphological Closing (R=%d) + Deep Fill: filled_pixels=%ld\n", morph_radius, closed_fill);
     fprintf(sum, "Fiber area before filling: %ld px\n", area_before);
     fprintf(sum, "Fiber area after filling: %ld px\n", area_after);
     fprintf(sum, "Void ratio Dr=(after-before)/before: %.6f\n", area_before ? (double)(area_after - area_before) / area_before : 0.0);
@@ -988,7 +944,7 @@ static int analyze(const char *input, const char *prefix, double um_per_px) {
     fprintf(sum, "Radius mean: %.6f px, %.6f um\n", stats_mean(&rpx), stats_mean(&rum));
     fprintf(sum, "Radius stddev: %.6f px, %.6f um\n", stats_std(&rpx), stats_std(&rum));
     fprintf(sum, "Radius min: %.6f px, %.6f um\n", rpx.count ? rpx.minv : 0.0, rum.count ? rum.minv : 0.0);
-    fprintf(sum, "Radius max: %.6f px, %.6f um\n", rpx.count ? rpx.maxv : 0.0, rum.count ? rum.maxv : 0.0);
+    fprintf(sum, "Radius max: %.6f px, %.6f um\n", rpx.count ? rpx.maxv : 0.0, rum.count ? rpx.maxv : 0.0);
     fprintf(sum, "Width mean: %.6f px, %.6f um\n", stats_mean(&wpx), stats_mean(&wum));
     fprintf(sum, "Width stddev: %.6f px, %.6f um\n", stats_std(&wpx), stats_std(&wum));
     fprintf(sum, "Width min/max: %.6f / %.6f px\n", wpx.count ? wpx.minv : 0.0, wpx.count ? wpx.maxv : 0.0);
@@ -1012,23 +968,30 @@ fail:
     return 0;
 }
 
-int main(int argc, char **argv) {
-    const char *input, *prefix;
-    double um_per_px = 0.85;
-    if (argc < 3 || argc > 4) {
-        fprintf(stderr, "Usage: %s input.bmp output_prefix [um_per_pixel]\n", argv[0]);
-        return 1;
+int main() {
+    // 您的硬编码输入输出路径保持不变
+    const char *input_path = "C:\\Users\\ASUS\\Desktop\\作业任务\\项目1 棉花纤维成熟度检测\\棉花纤维显微图像.bmp";
+    const char *output_prefix = "C:\\Users\\ASUS\\Desktop\\作业任务\\项目1 棉花纤维成熟度检测\\处理结果";
+    
+    // 默认的像素分辨率转换比例
+    double um_per_px = 0.85; 
+
+    printf("=========================================\n");
+    printf("正在启动棉花纤维成熟度检测算法(智能阈值版)...\n");
+    printf("读取路径: %s\n", input_path);
+    printf("输出目录: %s\n", output_prefix);
+    printf("=========================================\n\n");
+
+    if (analyze(input_path, output_prefix, um_per_px)) {
+        printf("\n?? 所有图像处理和数据分析均已完成！\n");
+        printf("智能阈值桥接已开启，请查看新生成的 04_filled_voids.bmp。\n");
+    } else {
+        printf("\n? 处理失败。请检查：\n");
+        printf("1. 原图像 %s 是否存在且未损坏。\n", input_path);
+        printf("2. 桌面文件夹是否具有写入权限。\n");
     }
-    input = argv[1];
-    prefix = argv[2];
-    if (argc == 4) {
-        char *endp = NULL;
-        errno = 0;
-        um_per_px = strtod(argv[3], &endp);
-        if (errno || !endp || *endp != '\0' || um_per_px <= 0.0) {
-            fprintf(stderr, "Invalid um_per_pixel: %s\n", argv[3]);
-            return 1;
-        }
-    }
-    return analyze(input, prefix, um_per_px) ? 0 : 2;
+
+    printf("\n");
+    system("pause");
+    return 0;
 }
